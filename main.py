@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 WiZ App Simulator using pywizlight (FIXED for v0.6.x)
 =====================================================
@@ -14,12 +15,30 @@ from pywizlight import wizlight, PilotBuilder, discovery
 from pywizlight.bulblibrary import BulbType
 from pywizlight.scenes import get_id_from_scene_name
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# WiZ Scene Definitions
+# ═════════════════════════════════════════════════════════════════════════════
+
+WIZ_SCENES: Dict[str, int] = {
+    "Ocean": 1, "Romance": 2, "Sunset": 3, "Party": 4, "Fireplace": 5,
+    "Cozy": 6, "Forest": 7, "Pastel Colors": 8, "Wake up": 9, "Bedtime": 10,
+    "Warm White": 11, "Daylight": 12, "Cool white": 13, "Night light": 14,
+    "Focus": 15, "Relax": 16, "True colors": 17, "TV time": 18,
+    "Plantgrowth": 19, "Spring": 20, "Summer": 21, "Fall": 22,
+    "Deepdive": 23, "Jungle": 24, "Mojito": 25, "Club": 26,
+    "Christmas": 27, "Halloween": 28, "Candlelight": 29,
+    "Golden white": 30, "Pulse": 31, "Steampunk": 32, "Rhythm": 33,
+}
+
+
 @dataclass
 class BulbInfo:
     ip: str
     mac: str
     name: str = "Unknown"
     bulb_type: Optional[BulbType] = None
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # WiZ Controller
@@ -269,8 +288,63 @@ class WiZController:
         for ip in self.bulbs:
             await self.print_status(ip)
 
-async def main(controller: WiZController) -> None:
-	await controller.discover("255.255.255.255")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Interactive Menu
+# ═════════════════════════════════════════════════════════════════════════════
+
+def print_menu() -> None:
+    print("\n" + "═" * 50)
+    print("         🏠 WiZ APP SIMULATOR")
+    print("═" * 50)
+    print("  1. 🔍 Discover devices")
+    print("  2. 💡 Turn ON bulb")
+    print("  3. 🌑 Turn OFF bulb")
+    print("  4. 🔘 Toggle bulb")
+    print("  5. 🔆 Set brightness")
+    print("  6. 🌡️  Set color temperature")
+    print("  7. 🎨 Set RGB color")
+    print("  8. 🎭 Set scene")
+    print("  9. 📊 Get bulb status")
+    print(" 10. 🔧 Get bulb capabilities")
+    print(" 11. 🌅 Set warm white")
+    print(" 12. ❄️  Set cold white")
+    print(" 13. 🌊 Set Rhythm mode")
+    print(" 14. 💡 Turn ALL on")
+    print(" 15. 🌑 Turn ALL off")
+    print(" 16. 📊 Status for ALL")
+    print("  0. 🚪 Exit")
+    print("═" * 50)
+
+
+def select_bulb(controller: WiZController) -> Optional[str]:
+    if not controller.bulbs:
+        print("❌ No bulbs discovered. Run option 1 first.")
+        return None
+    print("\n📱 Discovered devices:")
+    ips = list(controller.bulbs.keys())
+    for i, ip in enumerate(ips, 1):
+        info = controller.bulb_info[ip]
+        print(f"   {i}. {info.name} @ {ip}")
+    try:
+        choice = int(input("\nSelect device number: ")) - 1
+        if 0 <= choice < len(ips):
+            return ips[choice]
+        print("❌ Invalid selection.")
+        return None
+    except ValueError:
+        print("❌ Please enter a number.")
+        return None
+
+
+def print_scenes() -> None:
+    print("\n🎭 Available Scenes:")
+    for name, sid in WIZ_SCENES.items():
+        print(f"   {sid:2d}. {name}")
+
+
+async def interactive_menu(controller: WiZController) -> None:
+    await controller.discover("255.255.255.255")
 	
 	ips = list(controller.bulbs.keys())
 	for ip in ips:
@@ -278,6 +352,67 @@ async def main(controller: WiZController) -> None:
 		await controller.get_capabilities(ip)
 		await controller.toggle(ip)
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Entry Point
+# ═════════════════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(description="WiZ App Simulator")
+    parser.add_argument("--demo", action="store_true", help="Run quick demo")
+    parser.add_argument("--ip", type=str, help="Control bulb by IP directly")
+    parser.add_argument("--on", action="store_true")
+    parser.add_argument("--off", action="store_true")
+    parser.add_argument("--brightness", type=int)
+    parser.add_argument("--kelvin", type=int)
+    parser.add_argument("--rgb", type=str)
+    parser.add_argument("--scene", type=int)
+    parser.add_argument("--discover", action="store_true")
+    args = parser.parse_args()
+    
+    controller = WiZController()
+    
+    if args.demo:
+        # Quick demo
+        async def demo():
+            bulbs = await controller.discover("10.0.0.255")
+            if bulbs:
+                await controller.print_status(bulbs[0].ip)
+                await controller.set_rgb(bulbs[0].ip, 255, 0, 0)
+                await asyncio.sleep(2)
+                await controller.turn_off(bulbs[0].ip)
+        asyncio.run(demo())
+        return
+    
+    if args.ip:
+        controller.add_bulb(args.ip)
+        if args.discover:
+            asyncio.run(controller.get_capabilities(args.ip))
+            return
+        pilot = PilotBuilder()
+        if args.brightness is not None: pilot = PilotBuilder(brightness=args.brightness)
+        if args.kelvin: pilot = PilotBuilder(colortemp=args.kelvin)
+        if args.rgb:
+            r, g, b = map(int, args.rgb.split(","))
+            pilot = PilotBuilder(rgb=(r, g, b))
+        if args.scene: pilot = PilotBuilder(scene=args.scene)
+        if args.on:
+            asyncio.run(controller.turn_on(args.ip, pilot))
+        elif args.off:
+            asyncio.run(controller.turn_off(args.ip))
+        elif any([args.brightness, args.kelvin, args.rgb, args.scene]):
+            asyncio.run(controller.turn_on(args.ip, pilot))
+        else:
+            asyncio.run(controller.print_status(args.ip))
+        return
+    
+    if args.discover:
+        asyncio.run(controller.discover())
+        return
+    
+    print("🚀 WiZ App Simulator")
+    asyncio.run(interactive_menu(controller))
+
+
 if __name__ == "__main__":
-	controller = WiZController()
-    asyncio.run(main(controller))
+    main()
