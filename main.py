@@ -346,11 +346,11 @@ def print_scenes() -> None:
 async def interactive_menu(controller: WiZController) -> None:
     await controller.discover("255.255.255.255")
 	
-	ips = list(controller.bulbs.keys())
-	for ip in ips:
-		await controller.print_status(ip)
-		await controller.get_capabilities(ip)
-		await controller.toggle(ip)
+    ips = list(controller.bulbs.keys())
+    for ip in ips:
+        await controller.print_status(ip)
+        await controller.get_capabilities(ip)
+        await controller.toggle(ip)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Entry Point
