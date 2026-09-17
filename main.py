@@ -377,7 +377,7 @@ async def ws_loop(controller: WiZController, user: str, ip: str):
                         result: Result = await fn(**args)
                         await ws.send(json.dumps({
                             "id": data.get("id"),
-                            "result": str(result.to_dict())
+                            "result": result.to_dict()
                         }))
                     except Exception as e:
                         print(f"[hub-ws] error running {name}: {e}")
