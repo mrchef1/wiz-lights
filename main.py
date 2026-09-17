@@ -17,7 +17,7 @@ from pywizlight.scenes import get_id_from_scene_name
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-CONFIG_PATH = Path("D:\\IRIS_Hub\\config.json")
+CONFIG_PATH = Path("/home/iris/hub/config.json")
 IRIS_URL = "wss://backend.irisapis.us/api/devices/ws/{user}/{device_id}"
 
 
