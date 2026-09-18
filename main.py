@@ -5,6 +5,7 @@ WiZ Light Controller — LLM-ready tool interface via WebSocket
 
 import asyncio
 import json
+import time
 import websockets
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass
@@ -19,6 +20,14 @@ from pywizlight.scenes import get_id_from_scene_name
 
 CONFIG_PATH = Path("/home/iris/hub/config.json")
 IRIS_URL = "wss://backend.irisapis.us/api/devices/ws/{user}/{device_id}"
+
+# How often to poll the bulb for changes made outside of Iris
+# (WiZ app, wall switch, physical power cycle, other automations, etc.)
+STATE_POLL_INTERVAL = 2.0   # seconds
+
+# Re-send the device state at least this often even if nothing changed,
+# so the backend can tell the hub is still alive and stays in sync.
+HEARTBEAT_INTERVAL = 30.0   # seconds
 
 
 # ── Scene Definitions ────────────────────────────────────────────────────────
@@ -289,9 +298,58 @@ def load_config():
     return data["user"], data["device_id"], data.get("name", ""), data.get("room", "")
 
 
+# ── Device Struct ───────────────────────────────────────────────────────────
+
+async def build_device(
+    controller: WiZController,
+    ip: str,
+    metadata: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """
+    Build the device struct the backend expects from a fresh bulb poll.
+
+    Returns None if the bulb couldn't be reached, so callers never push a
+    misleading "off / 0" state to the backend just because a poll timed out.
+    """
+    status_result = await controller.get_status(ip)
+    if not status_result.success:
+        print(f"[hub-ws] status poll failed for {ip}: {status_result.message}")
+        return None
+
+    status = status_result.data or {}
+    info = controller.bulb_info.get(ip)
+
+    return {
+        "id": ip,
+        "name": info.bulb_type.name if info and info.bulb_type else "WiZ Bulb",
+        "type": "leds",
+        "status": "on" if status.get("power") == "ON" else "off",
+        "value": f"{status.get('brightness') or 0}",
+        "metadata": metadata,
+        # "room": "",
+    }
+
+
 # ── WebSocket Loop ──────────────────────────────────────────────────────────
 
 async def ws_loop(controller: WiZController, user: str, ip: str):
+    # Serialize UDP traffic to the bulb (commands + polls) and writes to the socket
+    bulb_lock = asyncio.Lock()
+    send_lock = asyncio.Lock()
+
+    # Command dispatch
+    functions = {
+        "turn_on": controller.turn_on,
+        "turn_off": controller.turn_off,
+        "toggle": controller.toggle,
+        "set_brightness": controller.set_brightness,
+        "set_rgb": controller.set_rgb,
+        "set_scene": controller.set_scene,
+        "get_status": controller.get_status,
+        "all_on": controller.all_on,
+        "all_off": controller.all_off,
+    }
+
     while True:
         try:
             iris_url = IRIS_URL.format(user=user, device_id=ip)
@@ -300,91 +358,111 @@ async def ws_loop(controller: WiZController, user: str, ip: str):
             async with websockets.connect(iris_url) as ws:
                 print("[hub-ws] connected")
 
-                # Build device struct
-                info = controller.bulb_info.get(ip)
-                status_result = await controller.get_status(ip)
-                status = status_result.data if status_result.success else {}
+                # Capabilities don't change, so fetch once per connection
                 features = await controller.get_capabilities(ip)
-                
-                device = {
-                    "id": ip,
-                    "name": info.bulb_type.name if info and info.bulb_type else "WiZ Bulb",
-                    "type": "leds",
-                    "status": "on" if status.get("power") == "ON" else "off",
-                    "value": f"{status.get('brightness', 0)}",
-                    "metadata": features.to_dict().get("data") if features.to_dict().get("success") else {},
-                    # "room": "",
-                }
-                
-                await ws.send(json.dumps(device))
-                
-                # Command dispatch
-                functions = {
-                    "turn_on": controller.turn_on,
-                    "turn_off": controller.turn_off,
-                    "toggle": controller.toggle,
-                    "set_brightness": controller.set_brightness,
-                    "set_rgb": controller.set_rgb,
-                    "set_scene": controller.set_scene,
-                    "get_status": controller.get_status,
-                    "all_on": controller.all_on,
-                    "all_off": controller.all_off,
-                }
-                
-                async for msg in ws:
-                    # Build device struct
-                    info = controller.bulb_info.get(ip)
-                    status_result = await controller.get_status(ip)
-                    status = status_result.data if status_result.success else {}
-                    features = await controller.get_capabilities(ip)
-                    
-                    device = {
-                        "id": ip,
-                        "name": info.bulb_type.name if info and info.bulb_type else "WiZ Bulb",
-                        "type": "leds",
-                        "status": "on" if status.get("power") == "ON" else "off",
-                        "value": f"{status.get('brightness', 0)}",
-                        "metadata": features.to_dict().get("data") if features.to_dict().get("success") else {},
-                        # "room": "",
-                    }
-                    
-                    await ws.send(json.dumps(device))
-                    
-                    data: dict = json.loads(msg)
-                    print(f"[hub-ws] recv: {data}")
-                    
-                    name = data.get("cmd")
-                    args = data.get("params") or {}
+                metadata = features.data if features.success and features.data else {}
 
-                    args["ip"] = ip  # Ensure IP is always passed to functions
-                    
-                    if name not in functions:
-                        print(f"[hub-ws] unknown function: {name}")
-                        continue
-                    
-                    # Ensure args is dict
-                    if not isinstance(args, dict):
+                last_sent: Optional[Dict[str, Any]] = None
+                last_sent_at: float = 0.0
+
+                async def push_state(force: bool = False):
+                    """Poll the bulb and send the device struct if it changed
+                    (or if forced / the heartbeat interval has elapsed)."""
+                    nonlocal last_sent, last_sent_at
+
+                    # Hold the lock through poll + send so an older poll
+                    # can never overwrite a newer one on the backend.
+                    async with bulb_lock:
+                        device = await build_device(controller, ip, metadata)
+                        if device is None:
+                            return
+
+                        heartbeat_due = (time.monotonic() - last_sent_at) >= HEARTBEAT_INTERVAL
+                        if not (force or heartbeat_due or device != last_sent):
+                            return
+
+                        async with send_lock:
+                            await ws.send(json.dumps(device))
+                        last_sent = device
+                        last_sent_at = time.monotonic()
+
+                async def publisher():
+                    """Keep the backend in sync with changes made outside Iris."""
+                    while True:
+                        await asyncio.sleep(STATE_POLL_INTERVAL)
+                        await push_state()
+
+                async def receiver():
+                    """Handle commands from the backend."""
+                    async for msg in ws:
                         try:
-                            args = json.loads(args)
+                            data: dict = json.loads(msg)
                         except Exception:
-                            print(f"[hub-ws] bad arguments for {name}: {args}")
+                            print(f"[hub-ws] bad message: {msg!r}")
                             continue
-                    
-                    fn = functions[name]
-                    print(f"[hub-ws] calling {name}({args})")
-                    
-                    try:
-                        result: Result = await fn(**args)
-                        await ws.send(json.dumps({
-                            "id": data.get("id"),
-                            "result": result.to_dict()
-                        }))
-                    except Exception as e:
-                        print(f"[hub-ws] error running {name}: {e}")
-                        await ws.send(json.dumps({
-                            "id": data.get("id"),
-                            "error": str(e)
-                        }))
+
+                        print(f"[hub-ws] recv: {data}")
+                        
+                        name = data.get("cmd")
+                        args = data.get("params") or {}
+
+                        # Ensure args is dict
+                        if not isinstance(args, dict):
+                            try:
+                                args = json.loads(args)
+                            except Exception:
+                                print(f"[hub-ws] bad arguments for {name}: {args}")
+                                continue
+
+                        args["ip"] = ip  # Ensure IP is always passed to functions
+                        
+                        if name not in functions:
+                            print(f"[hub-ws] unknown function: {name}")
+                            continue
+                        
+                        fn = functions[name]
+                        print(f"[hub-ws] calling {name}({args})")
+                        
+                        try:
+                            async with bulb_lock:
+                                result: Result = await fn(**args)
+                            async with send_lock:
+                                await ws.send(json.dumps({
+                                    "id": data.get("id"),
+                                    "result": result.to_dict()
+                                }))
+                        except websockets.ConnectionClosed:
+                            raise
+                        except Exception as e:
+                            print(f"[hub-ws] error running {name}: {e}")
+                            async with send_lock:
+                                await ws.send(json.dumps({
+                                    "id": data.get("id"),
+                                    "error": str(e)
+                                }))
+
+                        # Push the state *after* the command has been applied
+                        # (previously it was built before, so it was always one step behind)
+                        await push_state(force=True)
+
+                # Announce initial state immediately on connect
+                await push_state(force=True)
+
+                # Run both until one exits; if either dies, tear down and reconnect
+                tasks = [
+                    asyncio.create_task(receiver()),
+                    asyncio.create_task(publisher()),
+                ]
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for t in pending:
+                    t.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                for t in done:
+                    t.result()  # re-raise any exception so we hit the reconnect handler
+
+            # Clean close from the server side
+            print("[hub-ws] connection closed, reconnecting")
+            await asyncio.sleep(5)
                         
         except Exception as e:
             print(f"[hub-ws] error, reconnecting: {e}")
