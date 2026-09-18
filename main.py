@@ -4,16 +4,17 @@ WiZ Light Controller — LLM-ready tool interface via WebSocket
 """
 
 import asyncio
+import inspect
 import json
 import time
 import websockets
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Set, Union
 from dataclasses import dataclass
 from pathlib import Path
 
 from pywizlight import wizlight, PilotBuilder, discovery
 from pywizlight.bulblibrary import BulbType
-from pywizlight.scenes import get_id_from_scene_name
+from pywizlight.scenes import SCENES, SCENES_BY_CLASS
 
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -32,16 +33,41 @@ HEARTBEAT_INTERVAL = 30.0   # seconds
 
 # ── Scene Definitions ────────────────────────────────────────────────────────
 
-WIZ_SCENES: Dict[str, int] = {
-    "Ocean": 1, "Romance": 2, "Sunset": 3, "Party": 4, "Fireplace": 5,
-    "Cozy": 6, "Forest": 7, "Pastel Colors": 8, "Wake up": 9, "Bedtime": 10,
-    "Warm White": 11, "Daylight": 12, "Cool white": 13, "Night light": 14,
-    "Focus": 15, "Relax": 16, "True colors": 17, "TV time": 18,
-    "Plantgrowth": 19, "Spring": 20, "Summer": 21, "Fall": 22,
-    "Deepdive": 23, "Jungle": 24, "Mojito": 25, "Club": 26,
-    "Christmas": 27, "Halloween": 28, "Candlelight": 29,
-    "Golden white": 30, "Pulse": 31, "Steampunk": 32, "Rhythm": 33,
+# pywizlight's SCENES ({id: name}) is the single source of truth for scene IDs.
+# PilotBuilder(scene=...) expects the integer ID, so we never hardcode IDs here
+# (e.g. Rhythm is 1000 in pywizlight, and 33 is Diwali).
+
+def _normalize_scene(name: str) -> str:
+    """Lowercase and strip punctuation/spaces so 'Wake up', 'wake-up' and
+    'WAKE-UP' all match pywizlight's 'Wake-up'."""
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
+_SCENE_LOOKUP: Dict[str, int] = {
+    _normalize_scene(name): scene_id for scene_id, name in SCENES.items()
 }
+
+
+def resolve_scene_id(scene: Union[int, str]) -> int:
+    """
+    Turn a scene name or ID into a valid pywizlight scene ID.
+
+    Accepts an int, a numeric string ("4"), or a scene name (case/punctuation
+    insensitive). Raises ValueError if it isn't a scene pywizlight knows about.
+    """
+    scene_id: Optional[int] = None
+
+    if isinstance(scene, bool):
+        pass  # bool is an int subclass; never a valid scene
+    elif isinstance(scene, int):
+        scene_id = scene
+    elif isinstance(scene, str):
+        text = scene.strip()
+        scene_id = int(text) if text.isdigit() else _SCENE_LOOKUP.get(_normalize_scene(text))
+
+    if scene_id is None or scene_id not in SCENES:
+        raise ValueError(f"Unknown scene: {scene!r}")
+    return scene_id
 
 
 # ── Data Models ─────────────────────────────────────────────────────────────
@@ -175,24 +201,55 @@ class WiZController:
 
     # ── Scenes ───────────────────────────────────────────────────────────────
 
-    async def set_scene(self, ip: str, scene_name: str) -> Result:
-        if scene_name not in WIZ_SCENES:
-            return Result(success=False, message=f"Invalid scene: {scene_name}")
-        result = await self.turn_on(ip, PilotBuilder(scene=WIZ_SCENES[scene_name]))
+    async def _supported_scene_names(self, ip: str) -> Optional[Set[str]]:
+        """
+        Scene names this specific bulb supports, per pywizlight's SCENES_BY_CLASS
+        (RGB bulbs get everything; tunable-white and dimmable-white bulbs only
+        a subset). Returns None if the bulb class can't be determined, in which
+        case we skip the check and let the bulb decide.
+        """
+        try:
+            bulb_type = self.bulb_info[ip].bulb_type or await self.bulbs[ip].get_bulbtype()
+            names = SCENES_BY_CLASS.get(getattr(bulb_type, "bulb_type", None))
+            return set(names) if names else None
+        except Exception:
+            return None
+
+    async def set_scene(self, ip: str, scene_name: Union[str, int]) -> Result:
+        """Set a scene by name or ID (e.g. "Ocean", "wake up", 1)."""
+        if ip not in self.bulbs:
+            return Result(success=False, message=f"Bulb {ip} not found")
+
+        try:
+            scene_id = resolve_scene_id(scene_name)
+        except ValueError:
+            return Result(
+                success=False,
+                message=f"Invalid scene: {scene_name!r}. Available: {', '.join(sorted(SCENES.values()))}",
+            )
+
+        label = SCENES[scene_id]
+
+        supported = await self._supported_scene_names(ip)
+        if supported is not None and label not in supported:
+            return Result(
+                success=False,
+                message=f"Scene '{label}' isn't supported by this bulb. Supported: {', '.join(sorted(supported))}",
+            )
+
+        # PilotBuilder expects the integer scene ID
+        result = await self.turn_on(ip, PilotBuilder(scene=scene_id))
         if result.success:
-            result.message = f"Scene: {scene_name}"
+            result.message = f"Scene: {label}"
+            result.data = {"scene_id": scene_id, "scene": label}
         return result
 
     async def set_scene_by_name(self, ip: str, scene_name: str) -> Result:
-        try:
-            scene_id = get_id_from_scene_name(scene_name)
-            result = await self.set_scene(ip, scene_id)
-            return result
-        except ValueError:
-            return Result(success=False, message=f"Unknown scene: '{scene_name}'")
+        # set_scene resolves names itself; kept as an alias for existing callers
+        return await self.set_scene(ip, scene_name)
 
     async def set_rhythm(self, ip: str) -> Result:
-        return await self.set_scene(ip, 33)
+        return await self.set_scene(ip, "Rhythm")
 
     # ── Status & Capabilities ────────────────────────────────────────────────
 
@@ -343,6 +400,7 @@ async def ws_loop(controller: WiZController, user: str, ip: str):
         "turn_off": controller.turn_off,
         "toggle": controller.toggle,
         "set_brightness": controller.set_brightness,
+        "set_color_temp": controller.set_color_temp,
         "set_rgb": controller.set_rgb,
         "set_scene": controller.set_scene,
         "get_status": controller.get_status,
@@ -414,13 +472,19 @@ async def ws_loop(controller: WiZController, user: str, ip: str):
                                 print(f"[hub-ws] bad arguments for {name}: {args}")
                                 continue
 
-                        args["ip"] = ip  # Ensure IP is always passed to functions
-                        
                         if name not in functions:
                             print(f"[hub-ws] unknown function: {name}")
                             continue
                         
                         fn = functions[name]
+
+                        # Per-bulb functions always target this loop's bulb (overriding any
+                        # ip the caller sent). Batch functions (all_on/all_off) take no ip.
+                        if "ip" in inspect.signature(fn).parameters:
+                            args["ip"] = ip
+                        else:
+                            args.pop("ip", None)
+
                         print(f"[hub-ws] calling {name}({args})")
                         
                         try:
