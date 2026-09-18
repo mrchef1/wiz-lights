@@ -428,7 +428,7 @@ async def ws_loop(controller: WiZController, user: str, ip: str):
                                 result: Result = await fn(**args)
                             async with send_lock:
                                 await ws.send(json.dumps({
-                                    "id": data.get("id"),
+                                    "req": data.get("req"),
                                     "result": result.to_dict()
                                 }))
                         except websockets.ConnectionClosed:
@@ -437,7 +437,7 @@ async def ws_loop(controller: WiZController, user: str, ip: str):
                             print(f"[hub-ws] error running {name}: {e}")
                             async with send_lock:
                                 await ws.send(json.dumps({
-                                    "id": data.get("id"),
+                                    "req": data.get("req"),
                                     "error": str(e)
                                 }))
 
