@@ -360,7 +360,7 @@ def load_config():
 async def build_device(
     controller: WiZController,
     ip: str,
-    metadata: Dict[str, Any],
+    features: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
     """
     Build the device struct the backend expects from a fresh bulb poll.
@@ -382,7 +382,7 @@ async def build_device(
         "type": "leds",
         "status": "on" if status.get("power") == "ON" else "off",
         "value": f"{status.get('brightness') or 0}",
-        "metadata": metadata,
+        "metadata": {"type": "WiZ", "color_temp": status.get("color_temp"), "rgb": status.get("rgb"), "scene": status.get("scene"), "rssi": status.get("rssi"), "features": features},
         # "room": "",
     }
 
@@ -418,7 +418,6 @@ async def ws_loop(controller: WiZController, user: str, ip: str):
 
                 # Capabilities don't change, so fetch once per connection
                 features = await controller.get_capabilities(ip)
-                metadata = features.data if features.success and features.data else {}
 
                 last_sent: Optional[Dict[str, Any]] = None
                 last_sent_at: float = 0.0
@@ -431,7 +430,7 @@ async def ws_loop(controller: WiZController, user: str, ip: str):
                     # Hold the lock through poll + send so an older poll
                     # can never overwrite a newer one on the backend.
                     async with bulb_lock:
-                        device = await build_device(controller, ip, metadata)
+                        device = await build_device(controller, ip, features.data if features.success and features.data else {})
                         if device is None:
                             return
 
