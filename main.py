@@ -6,9 +6,8 @@ WiZ Light Controller — LLM-ready tool interface via WebSocket
 import asyncio
 import inspect
 import json
-import time
 import websockets
-from typing import List, Optional, Dict, Any, Set, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Union
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,13 +21,19 @@ from pywizlight.scenes import SCENES, SCENES_BY_CLASS
 CONFIG_PATH = Path("/home/iris/hub/config.json")
 IRIS_URL = "wss://backend.irisapis.us/api/devices/ws/{user}/{device_id}"
 
-# How often to poll the bulb for changes made outside of Iris
-# (WiZ app, wall switch, physical power cycle, other automations, etc.)
-STATE_POLL_INTERVAL = 2.0   # seconds
+# Seconds to wait between network scans for bulbs. Each scan also listens for
+# replies for ~5s, so a full cycle is roughly SCAN_INTERVAL + 5. Sensible range: 5-60.
+SCAN_INTERVAL = 15.0
 
-# Re-send the device state at least this often even if nothing changed,
-# so the backend can tell the hub is still alive and stays in sync.
-HEARTBEAT_INTERVAL = 30.0   # seconds
+# A bulb missing from this many consecutive scans is treated as offline: its
+# backend connection is closed, and it's reconnected automatically as soon as a
+# later scan sees it again. Broadcast discovery can occasionally miss a bulb, so
+# keep this at 2 or more. Set to 0 to never disconnect a bulb.
+OFFLINE_AFTER_MISSES = 3
+
+# Only used if push updates can't be started for a bulb (e.g. UDP port 38900 is
+# already taken by another program): poll the bulb at this interval instead.
+FALLBACK_POLL_INTERVAL = 2.0
 
 
 # ── Scene Definitions ────────────────────────────────────────────────────────
@@ -105,39 +110,66 @@ class WiZController:
     # ── Discovery ────────────────────────────────────────────────────────────
 
     async def discover(self, broadcast: str = "255.255.255.255") -> Result:
+        """
+        Scan the network for bulbs. Safe to call repeatedly: bulbs we already
+        track keep their existing wizlight object (and its push subscription),
+        and only unknown IPs are added.
+
+        data["seen"] = every IP that answered this scan
+        data["new"]  = the subset that wasn't tracked before
+        data["bulbs"] = ip/mac/name for everything in "seen"
+
+        success is False only if the scan itself failed; finding nothing is a
+        normal result (success=True, empty lists).
+        """
         try:
             found = await discovery.discover_lights(broadcast_space=broadcast)
+        except Exception as e:
+            return Result(success=False, message=f"Discovery failed: {e}")
 
-            self.bulbs.clear()
-            self.bulb_info.clear()
+        seen: List[str] = []
+        new: List[str] = []
 
-            for bulb in found:
+        for bulb in found:
+            if bulb.ip in self.bulbs:
+                seen.append(bulb.ip)
+                continue
+
+            try:
                 info = BulbInfo(ip=bulb.ip, mac=await bulb.getMac() or "Unknown")
                 try:
                     info.bulb_type = await bulb.get_bulbtype()
                     info.name = info.bulb_type.name if info.bulb_type else "WiZ Bulb"
                 except Exception:
                     info.name = "WiZ Bulb"
+            except Exception as e:
+                # Answered the broadcast but not a direct request; retried next scan
+                print(f"[wiz] {bulb.ip} answered discovery but couldn't be queried: {e}")
+                try:
+                    await bulb.async_close()
+                except Exception:
+                    pass
+                continue
 
-                self.bulbs[bulb.ip] = bulb
-                self.bulb_info[bulb.ip] = info
+            self.bulbs[bulb.ip] = bulb
+            self.bulb_info[bulb.ip] = info
+            seen.append(bulb.ip)
+            new.append(bulb.ip)
 
-            self.discovered = len(self.bulbs) > 0
+        self.discovered = len(self.bulbs) > 0
 
-            if self.discovered:
-                return Result(
-                    success=True,
-                    message=f"Found {len(self.bulbs)} device(s)",
-                    data={"bulbs": [
-                        {"ip": ip, "mac": info.mac, "name": info.name}
-                        for ip, info in self.bulb_info.items()
-                    ]}
-                )
-            else:
-                return Result(success=False, message="No WiZ devices found")
-
-        except Exception as e:
-            return Result(success=False, message=f"Discovery failed: {e}")
+        return Result(
+            success=True,
+            message=f"Found {len(seen)} device(s), {len(new)} new",
+            data={
+                "seen": seen,
+                "new": new,
+                "bulbs": [
+                    {"ip": ip, "mac": self.bulb_info[ip].mac, "name": self.bulb_info[ip].name}
+                    for ip in seen
+                ],
+            },
+        )
 
     def add_bulb(self, ip: str) -> Result:
         if ip not in self.bulbs:
@@ -145,6 +177,43 @@ class WiZController:
             self.bulb_info[ip] = BulbInfo(ip=ip, mac="Manual")
             return Result(success=True, message=f"Added bulb {ip}")
         return Result(success=True, message=f"Bulb {ip} already exists")
+
+    # ── Push Updates ─────────────────────────────────────────────────────────
+
+    async def start_push(self, ip: str, callback: Callable[[Any], None]) -> bool:
+        """
+        Subscribe to the bulb's own state pushes (syncPilot). The bulb sends one
+        whenever its state changes, whatever caused it: the WiZ app, a wall
+        switch, a remote, one of our commands, etc.
+
+        The callback is called synchronously from inside pywizlight, so keep it
+        tiny. Returns False if push couldn't be started, in which case the
+        caller should fall back to polling.
+        """
+        bulb = self.bulbs.get(ip)
+        if bulb is None:
+            return False
+        try:
+            await bulb.getMac()  # push subscriptions are keyed by MAC
+            return bool(await bulb.start_push(callback))
+        except Exception as e:
+            print(f"[wiz] push setup failed for {ip}: {e}")
+            return False
+
+    async def stop_bulb(self, ip: str) -> None:
+        """Stop push updates, close the bulb's socket, and stop tracking it."""
+        bulb = self.bulbs.pop(ip, None)
+        self.bulb_info.pop(ip, None)
+        if bulb is None:
+            return
+        try:
+            bulb.push_running = False  # ends the keep-alive re-registration chain
+            if bulb.push_cancel:
+                bulb.push_cancel()
+                bulb.push_cancel = None
+            await bulb.async_close()
+        except Exception as e:
+            print(f"[wiz] error closing {ip}: {e}")
 
     # ── Power Control ────────────────────────────────────────────────────────
 
@@ -258,6 +327,8 @@ class WiZController:
             return Result(success=False, message=f"Bulb {ip} not found")
         try:
             bulb = self.bulbs[ip]
+            # With push running this returns the pushed state without touching
+            # the network; otherwise it queries the bulb.
             await bulb.updateState()
             raw_state = bulb.state
 
@@ -363,14 +434,14 @@ async def build_device(
     features: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
     """
-    Build the device struct the backend expects from a fresh bulb poll.
+    Build the device struct the backend expects from the bulb's current state.
 
-    Returns None if the bulb couldn't be reached, so callers never push a
-    misleading "off / 0" state to the backend just because a poll timed out.
+    Returns None if the state couldn't be read, so callers never push a
+    misleading "off / 0" state to the backend.
     """
     status_result = await controller.get_status(ip)
     if not status_result.success:
-        print(f"[hub-ws] status poll failed for {ip}: {status_result.message}")
+        print(f"[hub-ws] status read failed for {ip}: {status_result.message}")
         return None
 
     status = status_result.data or {}
@@ -390,9 +461,21 @@ async def build_device(
 # ── WebSocket Loop ──────────────────────────────────────────────────────────
 
 async def ws_loop(controller: WiZController, user: str, ip: str):
-    # Serialize UDP traffic to the bulb (commands + polls) and writes to the socket
+    """
+    Keep one bulb connected to the backend. Runs until cancelled (which is what
+    the scanner does when the bulb goes offline), then releases the bulb.
+    """
+    # Serialize UDP traffic to the bulb (commands + reads) and writes to the socket
     bulb_lock = asyncio.Lock()
     send_lock = asyncio.Lock()
+
+    # Set by the bulb's push callback whenever its state changes
+    state_changed = asyncio.Event()
+
+    def on_push(_state: Any) -> None:
+        # Runs synchronously inside pywizlight's UDP handler: just flag it and
+        # let the publisher task do the real work.
+        state_changed.set()
 
     # Command dispatch
     functions = {
@@ -408,148 +491,215 @@ async def ws_loop(controller: WiZController, user: str, ip: str):
         "all_off": controller.all_off,
     }
 
-    while True:
-        try:
-            iris_url = IRIS_URL.format(user=user, device_id=ip)
-            print(f"[hub-ws] connecting to {iris_url}")
-            
-            async with websockets.connect(iris_url) as ws:
-                print("[hub-ws] connected")
+    push_active = False
 
-                # Capabilities don't change, so fetch once per connection
-                features = await controller.get_capabilities(ip)
+    try:
+        while True:
+            try:
+                # (Re)try push if it isn't running yet; once started it stays on
+                # across backend reconnects.
+                if not push_active:
+                    push_active = await controller.start_push(ip, on_push)
+                    if push_active:
+                        print(f"[hub-ws] {ip}: push updates enabled")
+                    else:
+                        print(f"[hub-ws] {ip}: push unavailable, polling every {FALLBACK_POLL_INTERVAL}s instead")
 
-                last_sent: Optional[Dict[str, Any]] = None
-                last_sent_at: float = 0.0
+                iris_url = IRIS_URL.format(user=user, device_id=ip)
+                print(f"[hub-ws] connecting to {iris_url}")
+                
+                async with websockets.connect(iris_url) as ws:
+                    print("[hub-ws] connected")
 
-                async def push_state(force: bool = False):
-                    """Poll the bulb and send the device struct if it changed
-                    (or if forced / the heartbeat interval has elapsed)."""
-                    nonlocal last_sent, last_sent_at
+                    # Capabilities don't change, so fetch once per connection
+                    features = await controller.get_capabilities(ip)
 
-                    # Hold the lock through poll + send so an older poll
-                    # can never overwrite a newer one on the backend.
-                    async with bulb_lock:
-                        device = await build_device(controller, ip, features.data if features.success and features.data else {})
-                        if device is None:
-                            return
+                    last_sent: Optional[Dict[str, Any]] = None
 
-                        heartbeat_due = (time.monotonic() - last_sent_at) >= HEARTBEAT_INTERVAL
-                        if not (force or heartbeat_due or device != last_sent):
-                            return
+                    async def push_state(force: bool = False):
+                        """Read the bulb's state and send the device struct to the
+                        backend if it changed (or if forced)."""
+                        nonlocal last_sent
 
-                        async with send_lock:
-                            await ws.send(json.dumps(device))
-                        last_sent = device
-                        last_sent_at = time.monotonic()
+                        # Hold the lock through read + send so an older read can
+                        # never overwrite a newer one on the backend.
+                        async with bulb_lock:
+                            device = await build_device(controller, ip, features.data if features.success and features.data else {})
+                            if device is None:
+                                return
 
-                async def publisher():
-                    """Keep the backend in sync with changes made outside Iris."""
-                    while True:
-                        await asyncio.sleep(STATE_POLL_INTERVAL)
-                        await push_state()
+                            if not force and device == last_sent:
+                                return
 
-                async def receiver():
-                    """Handle commands from the backend."""
-                    async for msg in ws:
-                        try:
-                            data: dict = json.loads(msg)
-                        except Exception:
-                            print(f"[hub-ws] bad message: {msg!r}")
-                            continue
+                            async with send_lock:
+                                await ws.send(json.dumps(device))
+                            last_sent = device
 
-                        print(f"[hub-ws] recv: {data}")
-                        
-                        name = data.get("cmd")
-                        args = data.get("params") or {}
+                    async def publisher():
+                        """Keep the backend in sync with the bulb. Driven by the
+                        bulb's pushes; only polls if push isn't available."""
+                        while True:
+                            if push_active:
+                                await state_changed.wait()
+                                state_changed.clear()
+                            else:
+                                await asyncio.sleep(FALLBACK_POLL_INTERVAL)
+                            await push_state()
 
-                        # Ensure args is dict
-                        if not isinstance(args, dict):
+                    async def receiver():
+                        """Handle commands from the backend."""
+                        async for msg in ws:
                             try:
-                                args = json.loads(args)
+                                data: dict = json.loads(msg)
                             except Exception:
-                                print(f"[hub-ws] bad arguments for {name}: {args}")
+                                print(f"[hub-ws] bad message: {msg!r}")
                                 continue
 
-                        if name not in functions:
-                            print(f"[hub-ws] unknown function: {name}")
-                            continue
-                        
-                        fn = functions[name]
+                            print(f"[hub-ws] recv: {data}")
+                            
+                            name = data.get("cmd")
+                            args = data.get("params") or {}
 
-                        # Per-bulb functions always target this loop's bulb (overriding any
-                        # ip the caller sent). Batch functions (all_on/all_off) take no ip.
-                        if "ip" in inspect.signature(fn).parameters:
-                            args["ip"] = ip
-                        else:
-                            args.pop("ip", None)
+                            # Ensure args is dict
+                            if not isinstance(args, dict):
+                                try:
+                                    args = json.loads(args)
+                                except Exception:
+                                    print(f"[hub-ws] bad arguments for {name}: {args}")
+                                    continue
 
-                        print(f"[hub-ws] calling {name}({args})")
-                        
-                        try:
-                            async with bulb_lock:
-                                result: Result = await fn(**args)
-                            async with send_lock:
-                                await ws.send(json.dumps({
-                                    "req": data.get("req"),
-                                    "result": result.to_dict()
-                                }))
-                        except websockets.ConnectionClosed:
-                            raise
-                        except Exception as e:
-                            print(f"[hub-ws] error running {name}: {e}")
-                            async with send_lock:
-                                await ws.send(json.dumps({
-                                    "req": data.get("req"),
-                                    "error": str(e)
-                                }))
+                            if name not in functions:
+                                print(f"[hub-ws] unknown function: {name}")
+                                continue
+                            
+                            fn = functions[name]
 
-                        # Push the state *after* the command has been applied
-                        # (previously it was built before, so it was always one step behind)
-                        await push_state(force=True)
+                            # Per-bulb functions always target this loop's bulb (overriding any
+                            # ip the caller sent). Batch functions (all_on/all_off) take no ip.
+                            if "ip" in inspect.signature(fn).parameters:
+                                args["ip"] = ip
+                            else:
+                                args.pop("ip", None)
 
-                # Announce initial state immediately on connect
-                await push_state(force=True)
+                            print(f"[hub-ws] calling {name}({args})")
+                            
+                            try:
+                                async with bulb_lock:
+                                    result: Result = await fn(**args)
+                                async with send_lock:
+                                    await ws.send(json.dumps({
+                                        "req": data.get("req"),
+                                        "result": result.to_dict()
+                                    }))
+                            except websockets.ConnectionClosed:
+                                raise
+                            except Exception as e:
+                                print(f"[hub-ws] error running {name}: {e}")
+                                async with send_lock:
+                                    await ws.send(json.dumps({
+                                        "req": data.get("req"),
+                                        "error": str(e)
+                                    }))
 
-                # Run both until one exits; if either dies, tear down and reconnect
-                tasks = [
-                    asyncio.create_task(receiver()),
-                    asyncio.create_task(publisher()),
-                ]
-                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                for t in pending:
-                    t.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-                for t in done:
-                    t.result()  # re-raise any exception so we hit the reconnect handler
+                            # With push on, the bulb reports the new state itself a moment
+                            # after the command lands (and reading now could return the
+                            # pre-command state), so the publisher handles it. Without push,
+                            # read it back ourselves.
+                            if not push_active:
+                                await push_state(force=True)
 
-            # Clean close from the server side
-            print("[hub-ws] connection closed, reconnecting")
-            await asyncio.sleep(5)
-                        
-        except Exception as e:
-            print(f"[hub-ws] error, reconnecting: {e}")
-            await asyncio.sleep(5)
+                    # Announce initial state immediately on connect
+                    await push_state(force=True)
+
+                    # Run both until one exits; if either dies, tear down and reconnect
+                    tasks = [
+                        asyncio.create_task(receiver()),
+                        asyncio.create_task(publisher()),
+                    ]
+                    try:
+                        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                        for t in done:
+                            t.result()  # re-raise any exception so we hit the reconnect handler
+                    finally:
+                        # Also runs if this loop is cancelled, so no task is left behind
+                        for t in tasks:
+                            t.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Clean close from the server side
+                print("[hub-ws] connection closed, reconnecting")
+                await asyncio.sleep(5)
+                            
+            except Exception as e:
+                print(f"[hub-ws] error, reconnecting: {e}")
+                await asyncio.sleep(5)
+    finally:
+        # Cancelled (bulb went offline) or shutting down: release the bulb
+        await controller.stop_bulb(ip)
+        print(f"[hub-ws] {ip}: disconnected")
+
+
+# ── Scanner ─────────────────────────────────────────────────────────────────
+
+async def scan_loop(controller: WiZController, user: str):
+    """
+    Scan for bulbs forever. Bulbs that show up get connected to the backend;
+    bulbs that stay missing for OFFLINE_AFTER_MISSES scans get disconnected, and
+    reconnect on their own when a later scan finds them again.
+    """
+    loops: Dict[str, asyncio.Task] = {}
+    missed: Dict[str, int] = {}
+    previous_seen: Optional[Set[str]] = None
+
+    try:
+        while True:
+            result = await controller.discover()
+
+            if not result.success:
+                # The scan itself failed (network down?): say so, but don't count
+                # it against any bulb.
+                print(f"[wiz] {result.message}")
+            else:
+                seen = set(result.data["seen"])
+
+                if seen != previous_seen:
+                    print(f"[wiz] {result.message}" + ("" if seen else f" (scanning every {SCAN_INTERVAL:g}s)"))
+                    previous_seen = seen
+
+                # Connect anything we can see that isn't connected
+                for ip in seen:
+                    missed[ip] = 0
+                    task = loops.get(ip)
+                    if task is not None and task.done():
+                        reason = "cancelled" if task.cancelled() else task.exception()
+                        print(f"[wiz] {ip}: connection task ended ({reason}), restarting")
+                    if task is None or task.done():
+                        print(f"[wiz] connecting {ip}")
+                        loops[ip] = asyncio.create_task(ws_loop(controller, user, ip))
+
+                # Disconnect bulbs that have stayed missing
+                for ip in list(loops):
+                    if ip in seen:
+                        continue
+                    missed[ip] = missed.get(ip, 0) + 1
+                    if OFFLINE_AFTER_MISSES and missed[ip] >= OFFLINE_AFTER_MISSES:
+                        print(f"[wiz] {ip} looks offline (missed {missed[ip]} scans), disconnecting")
+                        task = loops.pop(ip)
+                        missed.pop(ip, None)
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+
+            await asyncio.sleep(SCAN_INTERVAL)
+    finally:
+        for task in loops.values():
+            task.cancel()
+        await asyncio.gather(*loops.values(), return_exceptions=True)
 
 
 async def main():
     user, _, _, _ = load_config()
     controller = WiZController()
-    
-    # Initial discovery
-    discover_result = await controller.discover()
-    if not discover_result.success:
-        print(f"[wiz] {discover_result.message}")
-        return
-    
-    print(f"[wiz] {discover_result.message}")
-
-    tasks = [
-        asyncio.create_task(ws_loop(controller, user, ip))
-        for ip in controller.bulbs.keys()
-    ]
-
-    await asyncio.gather(*tasks, return_exceptions=True)
+    await scan_loop(controller, user)
 
 if __name__ == "__main__":
     asyncio.run(main())
